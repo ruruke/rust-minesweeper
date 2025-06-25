@@ -2,6 +2,7 @@ use ggez::{Context, GameResult};
 use ggez::graphics::{self, Color, DrawParam, Rect, Text};
 use ggez::event::{EventHandler, MouseButton};
 use rand::{self, Rng};
+use std::collections::HashMap;
 
 use crate::utils::constants::*;
 use crate::core::cell::Cell;
@@ -11,6 +12,8 @@ pub struct GameState {
     grid: Vec<Vec<Cell>>,
     game_over: bool,
     won: bool,
+    text_cache: HashMap<String, Text>,
+    unrevealed_non_mine_count: usize,
 }
 
 impl GameState {
@@ -19,10 +22,15 @@ impl GameState {
             grid: vec![vec![Cell::new(); GRID_SIZE]; GRID_SIZE],
             game_over: false,
             won: false,
+            text_cache: HashMap::new(),
+            unrevealed_non_mine_count: GRID_SIZE * GRID_SIZE,
         };
 
         state.place_mines();
         state.calculate_adjacent_mines();
+
+        // Update unrevealed_non_mine_count after placing mines
+        state.unrevealed_non_mine_count -= MINE_COUNT;
 
         // Reveal a safe starting area
         state.reveal_safe_starting_area();
@@ -32,31 +40,29 @@ impl GameState {
 
     // Reveal a safe starting area for the player
     fn reveal_safe_starting_area(&mut self) {
-        // Try to find a cell with no adjacent mines
-        for row in 0..GRID_SIZE {
-            for col in 0..GRID_SIZE {
-                if !self.grid[row][col].is_mine && self.grid[row][col].adjacent_mines == 0 {
-                    self.reveal_cell(row, col);
-                    return;
-                }
-            }
-        }
-
-        // If no cell with zero adjacent mines is found, find one with the minimum number
         let mut min_adjacent = 9;
         let mut min_row = 0;
         let mut min_col = 0;
 
+        // Single pass through the grid to find both zero and minimum adjacent mines
         for row in 0..GRID_SIZE {
             for col in 0..GRID_SIZE {
-                if !self.grid[row][col].is_mine && self.grid[row][col].adjacent_mines < min_adjacent {
-                    min_adjacent = self.grid[row][col].adjacent_mines;
-                    min_row = row;
-                    min_col = col;
+                if !self.grid[row][col].is_mine {
+                    if self.grid[row][col].adjacent_mines == 0 {
+                        // Found a cell with zero adjacent mines, reveal it and return
+                        self.reveal_cell(row, col);
+                        return;
+                    } else if self.grid[row][col].adjacent_mines < min_adjacent {
+                        // Keep track of the cell with minimum adjacent mines
+                        min_adjacent = self.grid[row][col].adjacent_mines;
+                        min_row = row;
+                        min_col = col;
+                    }
                 }
             }
         }
 
+        // If no cell with zero adjacent mines was found, reveal the one with minimum
         self.reveal_cell(min_row, min_col);
     }
 
@@ -85,25 +91,11 @@ impl GameState {
                 }
 
                 let mut count = 0;
-
-                // Check all 8 adjacent cells
-                for dr in -1..=1 {
-                    for dc in -1..=1 {
-                        if dr == 0 && dc == 0 {
-                            continue;
-                        }
-
-                        let new_row = row as isize + dr;
-                        let new_col = col as isize + dc;
-
-                        if new_row >= 0 && new_row < GRID_SIZE as isize && 
-                           new_col >= 0 && new_col < GRID_SIZE as isize {
-                            if self.grid[new_row as usize][new_col as usize].is_mine {
-                                count += 1;
-                            }
-                        }
+                self.for_each_adjacent_cell(row, col, |r, c| {
+                    if self.grid[r][c].is_mine {
+                        count += 1;
                     }
-                }
+                });
 
                 self.grid[row][col].adjacent_mines = count;
             }
@@ -124,8 +116,14 @@ impl GameState {
             return;
         }
 
+        // Decrement the unrevealed non-mine count
+        self.unrevealed_non_mine_count -= 1;
+
         // If it's a cell with no adjacent mines, reveal adjacent cells
         if self.grid[row][col].adjacent_mines == 0 {
+            // Collect adjacent cells to avoid borrowing issues
+            let mut adjacent_cells = Vec::new();
+
             for dr in -1..=1 {
                 for dc in -1..=1 {
                     if dr == 0 && dc == 0 {
@@ -137,13 +135,15 @@ impl GameState {
 
                     if new_row >= 0 && new_row < GRID_SIZE as isize && 
                        new_col >= 0 && new_col < GRID_SIZE as isize {
-                        let new_row = new_row as usize;
-                        let new_col = new_col as usize;
-
-                        if !self.grid[new_row][new_col].is_revealed && !self.grid[new_row][new_col].is_flagged {
-                            self.reveal_cell(new_row, new_col);
-                        }
+                        adjacent_cells.push((new_row as usize, new_col as usize));
                     }
+                }
+            }
+
+            // Process collected cells
+            for (new_row, new_col) in adjacent_cells {
+                if !self.grid[new_row][new_col].is_revealed && !self.grid[new_row][new_col].is_flagged {
+                    self.reveal_cell(new_row, new_col);
                 }
             }
         }
@@ -164,25 +164,42 @@ impl GameState {
         self.check_win();
     }
 
-    // Check if the player has won
-    fn check_win(&mut self) {
-        for row in 0..GRID_SIZE {
-            for col in 0..GRID_SIZE {
-                let cell = self.grid[row][col];
-
-                // If there's a non-mine cell that's not revealed, the game is not won yet
-                if !cell.is_mine && !cell.is_revealed {
-                    return;
+    // Helper function to iterate over adjacent cells
+    fn for_each_adjacent_cell<F>(&self, row: usize, col: usize, mut callback: F)
+    where
+        F: FnMut(usize, usize),
+    {
+        for dr in -1..=1 {
+            for dc in -1..=1 {
+                if dr == 0 && dc == 0 {
+                    continue;
                 }
 
-                // If there's a mine that's not flagged, the game is not won yet
-                if cell.is_mine && !cell.is_flagged {
-                    return;
+                let new_row = row as isize + dr;
+                let new_col = col as isize + dc;
+
+                if new_row >= 0 && new_row < GRID_SIZE as isize && 
+                   new_col >= 0 && new_col < GRID_SIZE as isize {
+                    callback(new_row as usize, new_col as usize);
                 }
             }
         }
+    }
 
-        self.won = true;
+    // Check if the player has won
+    fn check_win(&mut self) {
+        // Using the unrevealed_non_mine_count to check for win condition
+        if self.unrevealed_non_mine_count == 0 {
+            // Check if all mines are flagged
+            for row in 0..GRID_SIZE {
+                for col in 0..GRID_SIZE {
+                    if self.grid[row][col].is_mine && !self.grid[row][col].is_flagged {
+                        return;
+                    }
+                }
+            }
+            self.won = true;
+        }
     }
 }
 
@@ -193,6 +210,25 @@ impl EventHandler for GameState {
 
     fn draw(&mut self, ctx: &mut Context) -> GameResult {
         let mut canvas = graphics::Canvas::from_frame(ctx, Color::WHITE);
+
+        // Cache text objects if not already cached
+        if self.text_cache.is_empty() {
+            // Cache mine emoji
+            self.text_cache.insert("mine".to_string(), Text::new("💣"));
+
+            // Cache flag emoji
+            self.text_cache.insert("flag".to_string(), Text::new("🚩"));
+
+            // Cache numbers 1-8
+            for i in 1..=8 {
+                self.text_cache.insert(i.to_string(), Text::new(i.to_string()));
+            }
+
+            // Cache status messages
+            self.text_cache.insert("game_over".to_string(), Text::new("Game Over! Click to restart"));
+            self.text_cache.insert("won".to_string(), Text::new("You Won! Click to restart"));
+            self.text_cache.insert("playing".to_string(), Text::new("Left click: Reveal | Right click: Flag"));
+        }
 
         // Draw the grid
         for row in 0..GRID_SIZE {
@@ -237,29 +273,26 @@ impl EventHandler for GameState {
                 // Draw cell content
                 if cell.is_revealed {
                     if cell.is_mine {
-                        // Draw mine
-                        let text = Text::new("💣");
+                        // Draw mine using cached text
                         canvas.draw(
-                            &text,
+                            self.text_cache.get("mine").unwrap(),
                             DrawParam::default()
                                 .dest([x + CELL_SIZE / 4.0, y + CELL_SIZE / 4.0])
                                 .color(Color::BLACK),
                         );
                     } else if cell.adjacent_mines > 0 {
-                        // Draw number
-                        let text = Text::new(cell.adjacent_mines.to_string());
+                        // Draw number using cached text
                         canvas.draw(
-                            &text,
+                            self.text_cache.get(&cell.adjacent_mines.to_string()).unwrap(),
                             DrawParam::default()
                                 .dest([x + CELL_SIZE / 3.0, y + CELL_SIZE / 4.0])
                                 .color(Color::BLACK),
                         );
                     }
                 } else if cell.is_flagged {
-                    // Draw flag
-                    let text = Text::new("🚩");
+                    // Draw flag using cached text
                     canvas.draw(
-                        &text,
+                        self.text_cache.get("flag").unwrap(),
                         DrawParam::default()
                             .dest([x + CELL_SIZE / 4.0, y + CELL_SIZE / 4.0])
                             .color(Color::BLACK),
@@ -268,18 +301,17 @@ impl EventHandler for GameState {
             }
         }
 
-        // Draw game status
-        let status_text = if self.game_over {
-            "Game Over! Click to restart"
+        // Draw game status using cached text
+        let status_key = if self.game_over {
+            "game_over"
         } else if self.won {
-            "You Won! Click to restart"
+            "won"
         } else {
-            "Left click: Reveal | Right click: Flag"
+            "playing"
         };
 
-        let text = Text::new(status_text);
         canvas.draw(
-            &text,
+            self.text_cache.get(status_key).unwrap(),
             DrawParam::default()
                 .dest([10.0, SCREEN_HEIGHT - 40.0])
                 .color(Color::BLACK),
@@ -302,7 +334,10 @@ impl EventHandler for GameState {
     ) -> GameResult {
         // If game is over or won, restart the game
         if self.game_over || self.won {
+            // Preserve the text cache when restarting
+            let text_cache = std::mem::take(&mut self.text_cache);
             *self = GameState::new();
+            self.text_cache = text_cache;
             return Ok(());
         }
 
